@@ -126,12 +126,15 @@ type (
 		StopAfter               int
 		stopAfterMsgsLeft       chan int
 		notifyOnReconnect       bool
+		IdleTimeout             time.Duration
 	}
 
 	ConsumeErrHandlerFunc func(consumeCtx ConsumeContext, err error)
 
 	pullSubscription struct {
 		sync.Mutex
+		idleDeadline      *idleDeadlineMonitor
+		terminalErr       atomic.Value
 		id                string
 		consumer          *pullConsumer
 		subscription      *nats.Subscription
@@ -173,6 +176,15 @@ type (
 
 	hbMonitor struct {
 		timer *time.Timer
+		sync.Mutex
+	}
+
+	// idleDeadlineMonitor tracks an absolute idle deadline for a pull
+	// consumer. The deadline is refreshed (re-armed) only when a real (user)
+	// message is received. Heartbeat and status frames do not refresh it.
+	idleDeadlineMonitor struct {
+		timer *time.Timer
+		dur   time.Duration
 		sync.Mutex
 	}
 
@@ -236,6 +248,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 	sub.connStatusChanged = p.js.conn.StatusChanged(nats.CONNECTED, nats.RECONNECTING, nats.CLOSED)
 
 	sub.hbMonitor = sub.scheduleHeartbeatCheck(consumeOpts.Heartbeat)
+	sub.idleDeadline = sub.scheduleIdleDeadline(consumeOpts.IdleTimeout)
 
 	p.subs.Store(sub.id, sub)
 	p.Unlock()
@@ -279,6 +292,14 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 				}
 				sub.Stop()
 			}
+			return
+		}
+		// Real (user) message: refresh the idle deadline. Heartbeat and status
+		// frames return above and never reach this point.
+		if sub.idleDeadline != nil {
+			sub.idleDeadline.Reset()
+		}
+		if sub.closed.Load() == 1 {
 			return
 		}
 		if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {
@@ -376,6 +397,9 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 						}
 						if sub.hbMonitor != nil {
 							sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
+						}
+						if sub.idleDeadline != nil {
+							sub.idleDeadline.Reset()
 						}
 						sub.resetPendingMsgs()
 					}
@@ -535,6 +559,7 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 		consumeOpts: consumeOpts,
 	}
 	sub.connStatusChanged = p.js.conn.StatusChanged(nats.CONNECTED, nats.RECONNECTING)
+	sub.idleDeadline = sub.scheduleIdleDeadline(consumeOpts.IdleTimeout)
 	inbox := p.js.conn.NewInbox()
 	sub.subscription, err = p.js.conn.ChanSubscribe(inbox, sub.msgs)
 	if err != nil {
@@ -670,6 +695,11 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 				if s.consumer.js.conn.IsClosed() {
 					return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
 				}
+				// Report a terminal error (e.g. idle deadline exceeded) if one
+				// was recorded before the message channel was closed.
+				if termErr, ok := s.terminalErr.Load().(error); ok && termErr != nil {
+					return nil, termErr
+				}
 				return nil, ErrMsgIteratorClosed
 			}
 			if hbMonitor != nil {
@@ -686,6 +716,11 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 					return nil, termErr
 				}
 				continue
+			}
+			// Real (user) message: refresh the idle deadline. Heartbeat and
+			// status frames continue above and never reach this point.
+			if s.idleDeadline != nil {
+				s.idleDeadline.Reset()
 			}
 			if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {
 				s.consumer.setPinID(pinId)
@@ -1093,6 +1128,56 @@ func (s *pullSubscription) scheduleHeartbeatCheck(dur time.Duration) *hbMonitor 
 	}
 }
 
+// scheduleIdleDeadline arms the idle deadline timer. The timer fires after
+// dur unless refreshed by a real message. Returns nil if dur is 0 (disabled).
+func (s *pullSubscription) scheduleIdleDeadline(dur time.Duration) *idleDeadlineMonitor {
+	if dur <= 0 {
+		return nil
+	}
+	m := &idleDeadlineMonitor{dur: dur}
+	m.timer = time.AfterFunc(dur, func() {
+		s.onIdleDeadline()
+	})
+	return m
+}
+
+// Reset re-arms the idle deadline timer. It is called only when a real (user)
+// message is received. Heartbeat and status frames must not call Reset.
+func (m *idleDeadlineMonitor) Reset() {
+	if m == nil {
+		return
+	}
+	m.Lock()
+	m.timer.Reset(m.dur)
+	m.Unlock()
+}
+
+// Stop disarms the idle deadline timer.
+func (m *idleDeadlineMonitor) Stop() {
+	if m == nil {
+		return
+	}
+	m.Lock()
+	m.timer.Stop()
+	m.Unlock()
+}
+
+// onIdleDeadline is invoked when the idle deadline expires. It records the
+// terminal error, wakes up Next (for Messages) / the error handler (for
+// Consume), and cancels the subscription so no further messages are
+// dispatched.
+func (s *pullSubscription) onIdleDeadline() {
+	if s.closed.Load() == 1 {
+		return
+	}
+	s.terminalErr.Store(ErrIdleDeadlineExceeded)
+	select {
+	case s.errs <- ErrIdleDeadlineExceeded:
+	default:
+	}
+	s.Stop()
+}
+
 func (s *pullSubscription) cleanup() {
 	// For now this function does not need to hold the lock.
 	// Holding the lock here might cause a deadlock if Next()
@@ -1108,6 +1193,9 @@ func (s *pullSubscription) cleanup() {
 	}
 	if s.hbMonitor != nil {
 		s.hbMonitor.Stop()
+	}
+	if s.idleDeadline != nil {
+		s.idleDeadline.Stop()
 	}
 	drainMode := s.draining.Load() == 1
 	if drainMode {

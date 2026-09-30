@@ -423,6 +423,37 @@ func (hb PullHeartbeat) configureMessages(opts *consumeOpts) error {
 	return nil
 }
 
+// PullIdleTimeout sets an absolute idle deadline for a pull consumer. The
+// deadline is refreshed (re-armed) only when a real (user) message is
+// received. Heartbeat and status frames do not refresh it. If no real
+// message is received within the deadline, the consumer is cancelled and
+// [ErrIdleDeadlineExceeded] is returned.
+//
+// The value must be greater than 0. If not provided, the idle deadline is
+// disabled.
+//
+// PullIdleTimeout implements both PullConsumeOpt and PullMessagesOpt,
+// allowing it to configure Consumer.Consume and Consumer.Messages.
+type PullIdleTimeout time.Duration
+
+func (idle PullIdleTimeout) configureConsume(opts *consumeOpts) error {
+	idleTime := time.Duration(idle)
+	if idleTime <= 0 {
+		return fmt.Errorf("%w: idle timeout must be greater than 0", ErrInvalidOption)
+	}
+	opts.IdleTimeout = idleTime
+	return nil
+}
+
+func (idle PullIdleTimeout) configureMessages(opts *consumeOpts) error {
+	idleTime := time.Duration(idle)
+	if idleTime <= 0 {
+		return fmt.Errorf("%w: idle timeout must be greater than 0", ErrInvalidOption)
+	}
+	opts.IdleTimeout = idleTime
+	return nil
+}
+
 // StopAfter sets the number of messages after which the consumer is
 // automatically stopped and no more messages are pulled from the server.
 //
