@@ -315,6 +315,13 @@ var (
 	// time (if set).
 	ErrNoHeartbeat JetStreamError = &jsError{message: "no heartbeat received"}
 
+	// ErrConsumerIdleDeadline is received when a pull consumer did not receive
+	// any real messages before the configured idle deadline. Only delivery of
+	// an actual stream message refreshes the deadline; idle heartbeats and
+	// status frames do not. The subscription is stopped once this error is
+	// reported.
+	ErrConsumerIdleDeadline JetStreamError = &jsError{message: "pull consumer idle deadline exceeded"}
+
 	// ErrConsumerHasActiveSubscription is returned when a consumer is already
 	// subscribed to a stream.
 	ErrConsumerHasActiveSubscription JetStreamError = &jsError{message: "consumer has active subscription"}

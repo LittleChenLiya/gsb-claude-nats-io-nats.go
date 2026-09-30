@@ -131,6 +131,10 @@ type (
 		// - Consume can be optimized for throughput or memory usage using
 		//   PullExpiry, PullMaxMessages, PullMaxBytes and PullHeartbeat options.
 		//   Unless there is a specific use case, these options should not be used.
+		// - An absolute inactivity cutoff can be set with PullIdleDeadline: the
+		//   consumer is stopped with ErrConsumerIdleDeadline if no real message
+		//   is delivered before the deadline. Heartbeats and status frames do
+		//   not refresh it.
 		//
 		// Consume returns a ConsumeContext, which can be used to stop or drain
 		// the consumer.
@@ -146,6 +150,10 @@ type (
 		// - WithMessagesErrOnMissingHeartbeat can be used to enable/disable
 		//   erroring out on MessagesContext.Next when a heartbeat is missing.
 		//   This option is enabled by default.
+		// - An absolute inactivity cutoff can be set with PullIdleDeadline: the
+		//   iterator is closed with ErrConsumerIdleDeadline if no real message
+		//   is delivered before the deadline. Heartbeats and status frames do
+		//   not refresh it.
 		Messages(opts ...PullMessagesOpt) (MessagesContext, error)
 
 		// Next is used to retrieve the next message from the consumer. This

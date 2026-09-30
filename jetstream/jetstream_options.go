@@ -423,6 +423,42 @@ func (hb PullHeartbeat) configureMessages(opts *consumeOpts) error {
 	return nil
 }
 
+// PullIdleDeadline sets an absolute inactivity deadline for a pull
+// subscription. The deadline is armed when the subscription is created and is
+// refreshed only when an actual stream message is delivered. Idle heartbeats
+// and server status frames (e.g. batch timeouts) do not refresh it.
+//
+// If no real message is delivered before the deadline fires, the subscription
+// is stopped with [ErrConsumerIdleDeadline]: the error is passed to the
+// Consume error handler or returned from MessagesContext.Next, and no further
+// messages are dispatched.
+//
+// When set, PullIdleDeadline must be strictly greater than PullExpiry so that
+// an individual pull request has time to expire and be re-issued while the
+// consumer is idle. If not provided, no idle deadline is enforced.
+//
+// PullIdleDeadline implements both PullConsumeOpt and PullMessagesOpt,
+// allowing it to configure Consumer.Consume and Consumer.Messages.
+type PullIdleDeadline time.Duration
+
+func (d PullIdleDeadline) configureConsume(opts *consumeOpts) error {
+	deadline := time.Duration(d)
+	if deadline <= 0 {
+		return fmt.Errorf("%w: idle deadline must be greater than 0", ErrInvalidOption)
+	}
+	opts.IdleDeadline = deadline
+	return nil
+}
+
+func (d PullIdleDeadline) configureMessages(opts *consumeOpts) error {
+	deadline := time.Duration(d)
+	if deadline <= 0 {
+		return fmt.Errorf("%w: idle deadline must be greater than 0", ErrInvalidOption)
+	}
+	opts.IdleDeadline = deadline
+	return nil
+}
+
 // StopAfter sets the number of messages after which the consumer is
 // automatically stopped and no more messages are pulled from the server.
 //

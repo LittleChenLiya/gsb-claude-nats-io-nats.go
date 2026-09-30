@@ -119,6 +119,7 @@ type (
 		Priority                uint8
 		Group                   string
 		Heartbeat               time.Duration
+		IdleDeadline            time.Duration
 		ErrHandler              ConsumeErrHandler
 		ReportMissingHeartbeats bool
 		ThresholdMessages       int
@@ -140,6 +141,7 @@ type (
 		errs              chan error
 		pending           pendingMsgs
 		hbMonitor         *hbMonitor
+		idleDeadline      *idleDeadlineMonitor
 		fetchInProgress   atomic.Uint32
 		closed            atomic.Uint32
 		draining          atomic.Uint32
@@ -173,6 +175,19 @@ type (
 
 	hbMonitor struct {
 		timer *time.Timer
+		sync.Mutex
+	}
+
+	// idleDeadlineMonitor is an absolute idle deadline timer. Unlike the
+	// heartbeat monitor, a firing is significant: once it has fired for a
+	// given arming generation it must stay fired, even if a late message
+	// races to reset it. Each (re)arm bumps the generation captured by the
+	// timer callback, so an already-expired timer cannot be accidentally
+	// resurrected.
+	idleDeadlineMonitor struct {
+		fire       func()
+		timer      *time.Timer
+		generation atomic.Uint64
 		sync.Mutex
 	}
 
@@ -236,6 +251,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 	sub.connStatusChanged = p.js.conn.StatusChanged(nats.CONNECTED, nats.RECONNECTING, nats.CLOSED)
 
 	sub.hbMonitor = sub.scheduleHeartbeatCheck(consumeOpts.Heartbeat)
+	sub.idleDeadline = sub.scheduleIdleDeadlineCheck(consumeOpts.IdleDeadline)
 
 	p.subs.Store(sub.id, sub)
 	p.Unlock()
@@ -246,17 +262,14 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 		}
 		userMsg, msgErr := checkMsg(msg)
 		if !userMsg && msgErr == nil {
+			// heartbeat/control frame: it does not refresh the idle deadline.
 			if sub.hbMonitor != nil {
 				sub.hbMonitor.Reset(2 * consumeOpts.Heartbeat)
 			}
 			return
 		}
 		if !userMsg {
-			// heartbeat message
-			if msgErr == nil {
-				return
-			}
-
+			// status frame: it does not refresh the idle deadline.
 			sub.Lock()
 			termErr, notifyErr := sub.handleStatusMsg(msg, msgErr)
 			if termErr == nil {
@@ -281,6 +294,11 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 			}
 			return
 		}
+		// Once the subscription was stopped or canceled, no messages may be
+		// dispatched to the handler, even if a frame is already in flight.
+		if sub.closed.Load() == 1 {
+			return
+		}
 		if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {
 			p.setPinID(pinId)
 		}
@@ -291,6 +309,10 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 		sub.checkPending()
 		if sub.hbMonitor != nil {
 			sub.hbMonitor.Reset(2 * consumeOpts.Heartbeat)
+		}
+		// Only a real stream message refreshes the absolute idle deadline.
+		if sub.idleDeadline != nil {
+			sub.idleDeadline.Reset(consumeOpts.IdleDeadline)
 		}
 		sub.Unlock()
 
@@ -335,6 +357,10 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 		PinID:         p.getPinID(),
 	}, subject); err != nil {
 		sub.errs <- err
+	} else {
+		// The initial pull bypasses pullMessages; mark it in progress so
+		// checkPending does not issue a duplicate request on top of it.
+		sub.fetchInProgress.Store(1)
 	}
 	sub.Unlock()
 
@@ -363,7 +389,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							sub.errs <- errConnected
 						}
 
-						sub.fetchNext <- &pullRequest{
+						sub.enqueuePull(&pullRequest{
 							Expires:       sub.consumeOpts.Expires,
 							Batch:         sub.consumeOpts.MaxMessages,
 							MaxBytes:      sub.consumeOpts.MaxBytes,
@@ -373,7 +399,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							Priority:      sub.consumeOpts.Priority,
 							Group:         sub.consumeOpts.Group,
 							PinID:         p.getPinID(),
-						}
+						})
 						if sub.hbMonitor != nil {
 							sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
 						}
@@ -391,7 +417,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 					if sub.consumeOpts.StopAfter > 0 {
 						batchSize = min(batchSize, sub.consumeOpts.StopAfter-sub.delivered)
 					}
-					sub.fetchNext <- &pullRequest{
+					sub.enqueuePull(&pullRequest{
 						Expires:       sub.consumeOpts.Expires,
 						Batch:         batchSize,
 						MaxBytes:      sub.consumeOpts.MaxBytes,
@@ -401,7 +427,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 						Priority:      sub.consumeOpts.Priority,
 						Group:         sub.consumeOpts.Group,
 						PinID:         p.getPinID(),
-					}
+					})
 					if sub.hbMonitor != nil {
 						sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
 					}
@@ -411,7 +437,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 				if sub.consumeOpts.ErrHandler != nil {
 					sub.consumeOpts.ErrHandler(sub, err)
 				}
-				if errors.Is(err, ErrConnectionClosed) {
+				if errors.Is(err, ErrConnectionClosed) || errors.Is(err, ErrConsumerIdleDeadline) {
 					sub.Stop()
 				}
 			case <-sub.done:
@@ -478,7 +504,7 @@ func (s *pullSubscription) checkPending() {
 			if s.consumer != nil {
 				pinID = s.consumer.getPinID()
 			}
-			s.fetchNext <- &pullRequest{
+			s.enqueuePull(&pullRequest{
 				Expires:       s.consumeOpts.Expires,
 				Batch:         batchSize,
 				MaxBytes:      maxBytes,
@@ -488,11 +514,29 @@ func (s *pullSubscription) checkPending() {
 				MinPending:    s.consumeOpts.MinPending,
 				MinAckPending: s.consumeOpts.MinAckPending,
 				Priority:      s.consumeOpts.Priority,
-			}
+			})
 
 			s.pending.msgCount = s.consumeOpts.MaxMessages
 			s.pending.byteCount = s.consumeOpts.MaxBytes
 		}
+	}
+}
+
+// enqueuePull hands a pull request to the pullMessages loop and immediately
+// marks it as in progress. The flag must be set before another caller gets a
+// chance to run checkPending: the request can sit in the buffered channel for
+// an arbitrary amount of time before the loop dequeues it, and leaving the
+// flag at 0 in that window allows duplicate requests to be queued (and the
+// first one to be lost from the caller's accounting).
+// lock should be held before calling this method.
+func (s *pullSubscription) enqueuePull(req *pullRequest) {
+	if !s.fetchInProgress.CompareAndSwap(0, 1) {
+		return
+	}
+	select {
+	case s.fetchNext <- req:
+	case <-s.done:
+		s.fetchInProgress.Store(0)
 	}
 }
 
@@ -556,6 +600,8 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 
 	p.subs.Store(sub.id, sub)
 	p.Unlock()
+
+	sub.idleDeadline = sub.scheduleIdleDeadlineCheck(consumeOpts.IdleDeadline)
 
 	go sub.pullMessages(subject)
 
@@ -692,8 +738,16 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 			}
 			s.decrementPendingMsgs(msg)
 			s.incrementDeliveredMsgs()
+			// Only a real stream message refreshes the absolute idle deadline.
+			if s.idleDeadline != nil {
+				s.idleDeadline.Reset(s.consumeOpts.IdleDeadline)
+			}
 			return s.consumer.js.toJSMsg(msg), nil
 		case err := <-s.errs:
+			if errors.Is(err, ErrConsumerIdleDeadline) {
+				s.Stop()
+				return nil, err
+			}
 			if errors.Is(err, ErrNoHeartbeat) {
 				s.pending.msgCount = 0
 				s.pending.byteCount = 0
@@ -1059,8 +1113,6 @@ func (s *pullSubscription) pullMessages(subject string) {
 	for {
 		select {
 		case req := <-s.fetchNext:
-			s.fetchInProgress.Store(1)
-
 			if err := s.pull(req, subject); err != nil {
 				if errors.Is(err, ErrMsgIteratorClosed) {
 					s.cleanup()
@@ -1093,6 +1145,59 @@ func (s *pullSubscription) scheduleHeartbeatCheck(dur time.Duration) *hbMonitor 
 	}
 }
 
+// scheduleIdleDeadlineCheck arms an absolute idle deadline. Unlike the
+// heartbeat monitor, the timer is refreshed only after an actual stream
+// message was delivered; idle heartbeats and status frames do not extend it.
+func (s *pullSubscription) scheduleIdleDeadlineCheck(dur time.Duration) *idleDeadlineMonitor {
+	if dur == 0 {
+		return nil
+	}
+	m := &idleDeadlineMonitor{fire: func() { s.errs <- ErrConsumerIdleDeadline }}
+	m.arm(dur)
+	return m
+}
+
+// arm starts a fresh timer whose callback is bound to the current generation.
+// The caller must not hold the monitor lock.
+func (m *idleDeadlineMonitor) arm(dur time.Duration) {
+	m.Lock()
+	defer m.Unlock()
+	gen := m.generation.Add(1)
+	m.timer = time.AfterFunc(dur, func() {
+		if m.generation.Load() == gen {
+			m.fire()
+		}
+	})
+}
+
+// Stop cancels the idle deadline timer.
+func (m *idleDeadlineMonitor) Stop() {
+	m.Lock()
+	if m.timer != nil {
+		m.timer.Stop()
+	}
+	// Invalidate any in-flight callback as well.
+	m.generation.Add(1)
+	m.Unlock()
+}
+
+// Reset rearms the idle deadline for another dur window measured from now.
+// Bumping the generation invalidates the callback of a timer that already
+// expired but whose notification is still queued.
+func (m *idleDeadlineMonitor) Reset(dur time.Duration) {
+	m.Lock()
+	if m.timer != nil {
+		m.timer.Stop()
+	}
+	gen := m.generation.Add(1)
+	m.timer = time.AfterFunc(dur, func() {
+		if m.generation.Load() == gen {
+			m.fire()
+		}
+	})
+	m.Unlock()
+}
+
 func (s *pullSubscription) cleanup() {
 	// For now this function does not need to hold the lock.
 	// Holding the lock here might cause a deadlock if Next()
@@ -1108,6 +1213,9 @@ func (s *pullSubscription) cleanup() {
 	}
 	if s.hbMonitor != nil {
 		s.hbMonitor.Stop()
+	}
+	if s.idleDeadline != nil {
+		s.idleDeadline.Stop()
 	}
 	drainMode := s.draining.Load() == 1
 	if drainMode {
@@ -1225,6 +1333,9 @@ func (consumeOpts *consumeOpts) setDefaults(ordered bool) error {
 	}
 	if consumeOpts.Heartbeat > consumeOpts.Expires/2 {
 		return fmt.Errorf("%w: the value of Heartbeat must be less than 50%% of expiry", ErrInvalidOption)
+	}
+	if consumeOpts.IdleDeadline != 0 && consumeOpts.IdleDeadline <= consumeOpts.Expires {
+		return fmt.Errorf("%w: the value of IdleDeadline must be greater than expiry", ErrInvalidOption)
 	}
 	return nil
 }
