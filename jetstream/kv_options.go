@@ -74,6 +74,24 @@ func ResumeFromRevision(revision uint64) WatchOpt {
 	})
 }
 
+// WithSnapshotMarker instructs the key watcher to emit a typed SnapshotMarker
+// entry (instead of nil) when the initial snapshot is complete. The marker
+// is delivered in order on the Updates() channel: every entry received before
+// it is part of the initial snapshot, and every entry received after it is a
+// real-time update.
+//
+// WithSnapshotMarker cannot be used with UpdatesOnly, since there is no initial
+// snapshot to mark the boundary of.
+func WithSnapshotMarker() WatchOpt {
+	return watchOptFn(func(opts *watchOpts) error {
+		if opts.updatesOnly {
+			return fmt.Errorf("%w: snapshot marker cannot be used with updates only", ErrInvalidOption)
+		}
+		opts.snapshotMarker = true
+		return nil
+	})
+}
+
 // DeleteMarkersOlderThan indicates that delete or purge markers older than that
 // will be deleted as part of [KeyValue.PurgeDeletes] operation, otherwise, only the data
 // will be removed but markers that are recent will be kept.

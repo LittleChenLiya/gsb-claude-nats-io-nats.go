@@ -353,6 +353,18 @@ type (
 		Stop() error
 	}
 
+	// SnapshotMarker is a sentinel KeyValueEntry emitted by a watcher when
+	// the SnapshotMarker watch option is enabled. It marks the boundary
+	// between the initial snapshot and real-time updates: every entry
+	// received on the Updates() channel before the marker is part of the
+	// initial snapshot, and every entry received after it is a live update.
+	//
+	// A SnapshotMarker carries no key or value; only Bucket() returns the
+	// bucket name. All other accessors return their zero value.
+	SnapshotMarker struct {
+		bucket string
+	}
+
 	// KeyValueEntry is a retrieved entry for Get, List or Watch.
 	KeyValueEntry interface {
 		// Bucket is the bucket the data was loaded from.
@@ -396,6 +408,9 @@ type (
 		metaOnly bool
 		// resumeFromRevision is the revision to resume from.
 		resumeFromRevision uint64
+		// emit a typed SnapshotMarker instead of nil when the initial
+		// snapshot is complete.
+		snapshotMarker bool
 	}
 
 	// KVDeleteOpt is used to configure delete and purge operations.
@@ -1003,6 +1018,16 @@ func (e *kve) Created() time.Time    { return e.created }
 func (e *kve) Delta() uint64         { return e.delta }
 func (e *kve) Operation() KeyValueOp { return e.op }
 
+// SnapshotMarker accessors. A marker carries no key, value, revision,
+// timestamp, delta or operation; only Bucket() returns the bucket name.
+func (m *SnapshotMarker) Bucket() string    { return m.bucket }
+func (m *SnapshotMarker) Key() string       { return "" }
+func (m *SnapshotMarker) Value() []byte     { return nil }
+func (m *SnapshotMarker) Revision() uint64  { return 0 }
+func (m *SnapshotMarker) Created() time.Time { return time.Time{} }
+func (m *SnapshotMarker) Delta() uint64     { return 0 }
+func (m *SnapshotMarker) Operation() KeyValueOp { return 0 }
+
 // Get returns the latest value for the key.
 func (kv *kvs) Get(ctx context.Context, key string) (KeyValueEntry, error) {
 	e, err := kv.get(ctx, key, kvLatestRevision)
@@ -1215,12 +1240,10 @@ func purge() KVDeleteOpt {
 
 // Implementation for Watch
 type watcher struct {
-	mu          sync.Mutex
-	updates     chan KeyValueEntry
-	sub         *nats.Subscription
-	initDone    bool
-	initPending uint64
-	received    uint64
+	mu       sync.Mutex
+	updates  chan KeyValueEntry
+	sub      *nats.Subscription
+	initDone bool
 }
 
 // Updates returns the interior channel.
@@ -1229,6 +1252,17 @@ func (w *watcher) Updates() <-chan KeyValueEntry {
 		return nil
 	}
 	return w.updates
+}
+
+// sendSnapshotMarker emits the initial-snapshot boundary marker: a typed
+// SnapshotMarker when the SnapshotMarker option is set, otherwise nil.
+// The caller must hold w.mu.
+func (w *watcher) sendSnapshotMarker(bucket string, typed bool) {
+	if typed {
+		w.updates <- &SnapshotMarker{bucket: bucket}
+	} else {
+		w.updates <- nil
+	}
 }
 
 // Stop will unsubscribe from the watcher.
@@ -1318,15 +1352,17 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 			}
 			w.updates <- entry
 		}
-		// Check if done and initial values.
-		if !w.initDone {
-			w.received++
-			// Use the stable initPending value set at consumer creation.
-			// We're done if we've received all expected messages OR there are no more pending.
-			if w.received >= w.initPending || delta == 0 {
-				w.initDone = true
-				w.updates <- nil
-			}
+		// The initial snapshot is complete once the server reports no more
+		// messages pending for this consumer. Because the ordered consumer
+		// delivers in strict stream order, every message published before
+		// this point has already been delivered (no gaps) and every message
+		// delivered afterwards is a real-time update. We rely solely on the
+		// pending count rather than a fixed count of snapshot messages:
+		// updates published during startup are delivered in order and must
+		// not move the boundary.
+		if !w.initDone && delta == 0 {
+			w.initDone = true
+			w.sendSnapshotMarker(kv.name, o.snapshotMarker)
 		}
 	}
 
@@ -1371,13 +1407,9 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 	// Skip if UpdatesOnly() is set, since there will never be updates initially.
 	if !o.updatesOnly {
 		initialPending, err := sub.InitialConsumerPending()
-		if err == nil {
-			if initialPending == 0 {
-				w.initDone = true
-				w.updates <- nil
-			} else {
-				w.initPending = initialPending
-			}
+		if err == nil && initialPending == 0 {
+			w.initDone = true
+			w.sendSnapshotMarker(kv.name, o.snapshotMarker)
 		}
 	} else {
 		// if UpdatesOnly was used, mark initialization as complete
