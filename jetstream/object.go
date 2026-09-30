@@ -473,6 +473,7 @@ type (
 		ctx    context.Context
 		cancel context.CancelFunc
 		digest hash.Hash
+		sub    *nats.Subscription
 	}
 )
 
@@ -885,12 +886,6 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 	pr, pw := net.Pipe()
 	result.r = pr
 
-	gotErr := func(m *nats.Msg, err error) {
-		pw.Close()
-		m.Sub.Unsubscribe()
-		result.setErr(err)
-	}
-
 	// For calculating sum256
 	result.digest = sha256.New()
 
@@ -907,14 +902,14 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 			default:
 			}
 			if err != nil {
-				gotErr(m, err)
+				result.fail(err)
 				return
 			}
 		}
 
 		tokens, err := parser.GetMetadataFields(m.Reply)
 		if err != nil {
-			gotErr(m, err)
+			result.fail(err)
 			return
 		}
 
@@ -922,7 +917,7 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 		for b := m.Data; len(b) > 0; {
 			n, err := pw.Write(b)
 			if err != nil {
-				gotErr(m, err)
+				result.fail(err)
 				return
 			}
 			b = b[n:]
@@ -933,7 +928,7 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 		// Check if we are done.
 		if tokens[parser.AckNumPendingTokenPos] == objNoPending {
 			pw.Close()
-			m.Sub.Unsubscribe()
+			result.unsubscribe()
 		}
 	}
 
@@ -944,10 +939,11 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 		nats.Context(ctx),
 		nats.BindStream(streamName),
 	}
-	_, err = obs.pushJS.Subscribe(chunkSubj, processChunk, subscribeOpts...)
+	sub, err := obs.pushJS.Subscribe(chunkSubj, processChunk, subscribeOpts...)
 	if err != nil {
 		return nil, err
 	}
+	result.sub = sub
 
 	return result, nil
 }
@@ -1461,6 +1457,8 @@ func (o *objResult) Read(p []byte) (n int, err error) {
 		default:
 		}
 	}
+	// Once a terminal error has been observed (e.g. digest mismatch or
+	// context cancellation), every subsequent Read reports the same error.
 	if o.err != nil {
 		return 0, o.err
 	}
@@ -1486,17 +1484,26 @@ func (o *objResult) Read(p []byte) (n int, err error) {
 		}
 	}
 	if err == io.EOF {
-		// Make sure the digest matches.
+		// The stream ended. The object is only considered complete when the
+		// digest of the bytes we received matches the one recorded in the
+		// object info; a mismatch (corrupt or truncated chunks) is a terminal
+		// failure and must never be reported as a successful read.
 		sha := o.digest.Sum(nil)
 		rsha, decodeErr := DecodeObjectDigest(o.info.Digest)
 		if decodeErr != nil {
-			o.err = decodeErr
+			o.failLocked(decodeErr)
 			return 0, o.err
 		}
 		if !bytes.Equal(sha[:], rsha) {
-			o.err = ErrDigestMismatch
+			o.failLocked(ErrDigestMismatch)
 			return 0, o.err
 		}
+	} else if err != nil {
+		// The pipe was closed with an error (e.g. context cancellation while
+		// chunks were still arriving). Record it as the terminal error so that
+		// later Reads reproduce the same failure instead of silently succeeding.
+		o.failLocked(err)
+		return 0, o.err
 	}
 	return n, err
 }
@@ -1505,19 +1512,53 @@ func (o *objResult) Read(p []byte) (n int, err error) {
 func (o *objResult) Close() error {
 	o.Lock()
 	defer o.Unlock()
+	o.releaseLocked()
 	if o.cancel != nil {
 		o.cancel()
+		o.cancel = nil
 	}
-	if o.r == nil {
-		return nil
-	}
-	return o.r.Close()
+	return nil
 }
 
-func (o *objResult) setErr(err error) {
+// fail records err as the terminal error and releases the reader resources
+// (chunk subscription and pipe). It is safe to call more than once; the first
+// terminal error wins.
+func (o *objResult) fail(err error) {
 	o.Lock()
 	defer o.Unlock()
-	o.err = err
+	o.failLocked(err)
+}
+
+func (o *objResult) failLocked(err error) {
+	if o.err == nil {
+		o.err = err
+	}
+	o.releaseLocked()
+}
+
+// unsubscribe removes the chunk subscription. It is safe to call more than
+// once.
+func (o *objResult) unsubscribe() {
+	o.Lock()
+	defer o.Unlock()
+	o.unsubscribeLocked()
+}
+
+func (o *objResult) unsubscribeLocked() {
+	if o.sub != nil {
+		_ = o.sub.Unsubscribe()
+		o.sub = nil
+	}
+}
+
+// releaseLocked tears down the reader side: the chunk subscription is removed
+// so the server stops delivering messages, and the pipe is closed.
+func (o *objResult) releaseLocked() {
+	o.unsubscribeLocked()
+	if o.r != nil {
+		_ = o.r.Close()
+		o.r = nil
+	}
 }
 
 func (o *objResult) Info() (*ObjectInfo, error) {

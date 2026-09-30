@@ -151,6 +151,139 @@ func TestObjectBasics(t *testing.T) {
 	})
 }
 
+// TestObjectDigestVerification exercises the object reader's terminal state
+// after a streaming digest failure. It covers:
+//   - a complete object: all bytes are delivered with no error;
+//   - a corrupt chunk (a chunk message replaced after upload): every byte is
+//     delivered but the digest check fails, and the failure is reproduced on
+//     subsequent Reads and reported by Info/Error;
+//   - an early truncation (the last chunk removed): the stream ends before the
+//     object is complete, the digest check fails and the byte count is short;
+//   - resource release: Close removes the chunk subscription.
+func TestObjectDigestVerification(t *testing.T) {
+	withJSServer(t, func(t *testing.T, nc *nats.Conn, js jetstream.JetStream) {
+		ctx := newTesterCtx(t, 30*time.Second)
+		const chunkSize = 32
+		data := make([]byte, 7*chunkSize)
+		_, err := rand.Read(data)
+		expectOk(t, err)
+
+		obs, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: "OBJS"})
+		expectOk(t, err)
+
+		_, err = obs.Put(ctx, jetstream.ObjectMeta{
+			Name: "obj",
+			Opts: &jetstream.ObjectMetaOptions{ChunkSize: chunkSize},
+		}, bytes.NewReader(data))
+		expectOk(t, err)
+
+		info, err := obs.GetInfo(ctx, "obj")
+		expectOk(t, err)
+		if info.Chunks != 7 {
+			t.Fatalf("expected 7 chunks, got %d", info.Chunks)
+		}
+		const streamName = "OBJ_OBJS"
+		chunkSubj := fmt.Sprintf("$O.%s.C.%s", "OBJS", info.NUID)
+
+		// drain reads the object to its terminal state and returns the number
+		// of bytes read and the terminal error. io.EOF means the object was
+		// read completely and its digest matched.
+		drain := func() (int, error, jetstream.ObjectResult) {
+			result, err := obs.Get(ctx, "obj")
+			if err != nil {
+				return 0, err, nil
+			}
+			buf := make([]byte, chunkSize)
+			total := 0
+			for {
+				n, err := result.Read(buf)
+				total += n
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						return total, nil, result
+					}
+					return total, err, result
+				}
+			}
+		}
+
+		// 1. Complete object: every byte, no error.
+		n, err, _ := drain()
+		if err != nil {
+			t.Fatalf("complete object: unexpected error: %v", err)
+		}
+		if n != len(data) {
+			t.Fatalf("complete object: expected %d bytes, got %d", len(data), n)
+		}
+
+		stream, err := js.Stream(ctx, streamName)
+		expectOk(t, err)
+
+		// 2. Corrupt chunk: delete chunk 2 and republish corrupted data in its
+		// place. All chunks are delivered (full byte count) but the digest no
+		// longer matches.
+		expectOk(t, stream.DeleteMsg(ctx, 2))
+		corrupted := make([]byte, chunkSize)
+		_, err = rand.Read(corrupted)
+		expectOk(t, err)
+		msg := nats.NewMsg(chunkSubj)
+		msg.Data = corrupted
+		_, err = js.PublishMsg(ctx, msg)
+		expectOk(t, err)
+
+		n, err, result := drain()
+		if !errors.Is(err, jetstream.ErrDigestMismatch) {
+			t.Fatalf("corrupt chunk: expected ErrDigestMismatch, got %v", err)
+		}
+		if n != len(data) {
+			t.Fatalf("corrupt chunk: expected full delivery of %d bytes, got %d", len(data), n)
+		}
+		// The failure must be reproduced on every subsequent Read and reported
+		// by Info/Error.
+		buf := make([]byte, chunkSize)
+		if _, err := result.Read(buf); !errors.Is(err, jetstream.ErrDigestMismatch) {
+			t.Fatalf("corrupt chunk: second Read did not reproduce ErrDigestMismatch, got %v", err)
+		}
+		if _, err := result.Info(); !errors.Is(err, jetstream.ErrDigestMismatch) {
+			t.Fatalf("corrupt chunk: Info did not report ErrDigestMismatch, got %v", err)
+		}
+		if !errors.Is(result.Error(), jetstream.ErrDigestMismatch) {
+			t.Fatalf("corrupt chunk: Error did not report ErrDigestMismatch, got %v", result.Error())
+		}
+		expectOk(t, result.Close())
+
+		// 3. Early truncation: delete the last chunk (seq 7). The stream ends
+		// before the object is complete; the byte count is short and the digest
+		// check fails.
+		expectOk(t, stream.DeleteMsg(ctx, 7))
+		n, err, result = drain()
+		if !errors.Is(err, jetstream.ErrDigestMismatch) {
+			t.Fatalf("truncated: expected ErrDigestMismatch, got %v", err)
+		}
+		if n != 6*chunkSize {
+			t.Fatalf("truncated: expected %d bytes (6 chunks), got %d", 6*chunkSize, n)
+		}
+		if n >= len(data) {
+			t.Fatalf("truncated: expected fewer than %d bytes, got %d", len(data), n)
+		}
+		expectOk(t, result.Close())
+
+		// 4. Release: Close removes the chunk subscription.
+		before := nc.NumSubscriptions()
+		result, err = obs.Get(ctx, "obj")
+		expectOk(t, err)
+		// Read a little so the subscription is active.
+		_, _ = result.Read(buf)
+		if nc.NumSubscriptions() <= before {
+			t.Fatalf("expected subscription to be active after Get: before=%d after=%d", before, nc.NumSubscriptions())
+		}
+		expectOk(t, result.Close())
+		if nc.NumSubscriptions() != before {
+			t.Fatalf("expected subscription count to return to %d after Close, got %d", before, nc.NumSubscriptions())
+		}
+	})
+}
+
 func TestCreateObjectStore(t *testing.T) {
 	withJSServer(t, func(t *testing.T, _ *nats.Conn, js jetstream.JetStream) {
 		ctx := newTesterCtx(t, 10*time.Second)
