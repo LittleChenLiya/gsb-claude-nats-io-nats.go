@@ -699,6 +699,10 @@ type Conn struct {
 	// Msg filters for testing.
 	// Protected by subsMu
 	filters map[string]msgFilter
+
+	// reconnectRecovery tracks subscription IDs during reconnect recovery.
+	// Protected by subsMu.
+	reconnectRecovery *reconnectRecoveryState
 }
 
 type natsReader struct {
@@ -767,6 +771,95 @@ type Subscription struct {
 	pMsgsLimit  int
 	pBytesLimit int
 	dropped     int
+}
+
+// ReconnectRecoveryList is a read-only snapshot of subscription IDs
+// tracked during reconnect recovery. It lists subscriptions that are
+// pending rebuild and those that have been recovered.
+//
+// The list contains only subscription IDs (sids), never subjects,
+// queues, or any other potentially sensitive data.
+type ReconnectRecoveryList struct {
+	pending   []int64
+	recovered []int64
+}
+
+// Pending returns the subscription IDs that are pending rebuild.
+// The returned slice is a copy and is safe to modify.
+func (l *ReconnectRecoveryList) Pending() []int64 {
+	if l == nil || len(l.pending) == 0 {
+		return nil
+	}
+	out := make([]int64, len(l.pending))
+	copy(out, l.pending)
+	return out
+}
+
+// Recovered returns the subscription IDs that have been recovered.
+// The returned slice is a copy and is safe to modify.
+func (l *ReconnectRecoveryList) Recovered() []int64 {
+	if l == nil || len(l.recovered) == 0 {
+		return nil
+	}
+	out := make([]int64, len(l.recovered))
+	copy(out, l.recovered)
+	return out
+}
+
+// reconnectRecoveryState tracks subscription IDs during reconnect recovery.
+// It is protected by conn.subsMu.
+type reconnectRecoveryState struct {
+	pending   map[int64]struct{}
+	recovered map[int64]struct{}
+}
+
+// newReconnectRecoveryState creates a new recovery state with all the
+// given subscription IDs marked as pending rebuild.
+func newReconnectRecoveryState(subs map[int64]*Subscription) *reconnectRecoveryState {
+	state := &reconnectRecoveryState{
+		pending:   make(map[int64]struct{}),
+		recovered: make(map[int64]struct{}),
+	}
+	for sid := range subs {
+		state.pending[sid] = struct{}{}
+	}
+	return state
+}
+
+// markRecovered moves a subscription ID from pending to recovered.
+// It is a no-op if the ID is not in the pending set.
+func (s *reconnectRecoveryState) markRecovered(sid int64) {
+	if _, ok := s.pending[sid]; ok {
+		delete(s.pending, sid)
+		s.recovered[sid] = struct{}{}
+	}
+}
+
+// remove removes a subscription ID from both pending and recovered.
+// Used when a subscription is canceled during reconnect.
+func (s *reconnectRecoveryState) remove(sid int64) {
+	delete(s.pending, sid)
+	delete(s.recovered, sid)
+}
+
+// snapshot returns a read-only ReconnectRecoveryList with stable ordering.
+func (s *reconnectRecoveryState) snapshot() *ReconnectRecoveryList {
+	pending := make([]int64, 0, len(s.pending))
+	for sid := range s.pending {
+		pending = append(pending, sid)
+	}
+	slices.Sort(pending)
+
+	recovered := make([]int64, 0, len(s.recovered))
+	for sid := range s.recovered {
+		recovered = append(recovered, sid)
+	}
+	slices.Sort(recovered)
+
+	return &ReconnectRecoveryList{
+		pending:   pending,
+		recovered: recovered,
+	}
 }
 
 // Status represents the state of the connection.
@@ -3333,6 +3426,13 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 	// Clear any errors.
 	nc.err = nil
 
+	// Initialize the reconnect recovery list with the current subscription
+	// state. All existing subscriptions start as pending rebuild and will
+	// move to recovered as they are resent.
+	nc.subsMu.Lock()
+	nc.reconnectRecovery = newReconnectRecoveryState(nc.subs)
+	nc.subsMu.Unlock()
+
 	// Perform appropriate callback if needed for a disconnect.
 	// DisconnectedErrCB has priority over deprecated DisconnectedCB
 	if !nc.initc {
@@ -5183,6 +5283,22 @@ func (nc *Conn) NumSubscriptions() int {
 	return len(nc.subs)
 }
 
+// ReconnectRecoveryList returns a read-only snapshot of subscription IDs
+// tracked during reconnect recovery. The list is reset on each reconnect
+// attempt and lists subscriptions that are pending rebuild and those that
+// have been recovered.
+//
+// Returns nil if no reconnect recovery has occurred. The returned list
+// contains only subscription IDs, never subjects, queues, or credentials.
+func (nc *Conn) ReconnectRecoveryList() *ReconnectRecoveryList {
+	nc.subsMu.RLock()
+	defer nc.subsMu.RUnlock()
+	if nc.reconnectRecovery == nil {
+		return nil
+	}
+	return nc.reconnectRecovery.snapshot()
+}
+
 // Lock for nc should be held here upon entry
 func (nc *Conn) removeSub(s *Subscription) {
 	nc.subsMu.Lock()
@@ -5527,6 +5643,13 @@ func (nc *Conn) unsubscribe(sub *Subscription, max int, drainMode bool) error {
 
 	if maxStr == _EMPTY_ && !drainMode {
 		nc.removeSub(s)
+		// If a subscription is canceled during reconnect it must not be
+		// re-added. Remove it from the reconnect recovery list.
+		nc.subsMu.Lock()
+		if nc.reconnectRecovery != nil {
+			nc.reconnectRecovery.remove(s.sid)
+		}
+		nc.subsMu.Unlock()
 	}
 
 	if drainMode {
@@ -6110,6 +6233,13 @@ func (nc *Conn) resendSubscriptions() {
 			if adjustedMax == 0 {
 				s.mu.Unlock()
 				nc.bw.writeDirect(fmt.Sprintf(unsubProto, sid, _EMPTY_))
+				// This subscription is not being rebuilt; remove it from
+				// the recovery list.
+				nc.subsMu.Lock()
+				if nc.reconnectRecovery != nil {
+					nc.reconnectRecovery.remove(sid)
+				}
+				nc.subsMu.Unlock()
 				continue
 			}
 		}
@@ -6121,6 +6251,12 @@ func (nc *Conn) resendSubscriptions() {
 			maxStr := strconv.Itoa(int(adjustedMax))
 			nc.bw.writeDirect(fmt.Sprintf(unsubProto, sid, maxStr))
 		}
+		// Subscription state has been resent; mark as recovered.
+		nc.subsMu.Lock()
+		if nc.reconnectRecovery != nil {
+			nc.reconnectRecovery.markRecovered(sid)
+		}
+		nc.subsMu.Unlock()
 	}
 }
 
