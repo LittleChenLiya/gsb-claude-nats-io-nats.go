@@ -464,6 +464,11 @@ var (
 	// ErrDigestMismatch is returned when the digests of an object do not match.
 	ErrDigestMismatch JetStreamError = &jsError{message: "received a corrupt object, digests do not match"}
 
+	// ErrObjectIncomplete is returned when the object's chunk stream ends
+	// before all chunks have been received, e.g. the underlying subscription
+	// was closed or the connection was lost while reading.
+	ErrObjectIncomplete JetStreamError = &jsError{message: "object stream ended before all chunks were received"}
+
 	// ErrInvalidDigestFormat is returned when the digest hash of an object has
 	// an invalid format.
 	ErrInvalidDigestFormat JetStreamError = &jsError{message: "object digest hash has invalid format"}

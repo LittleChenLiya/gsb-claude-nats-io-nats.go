@@ -467,9 +467,20 @@ type (
 	// ObjectResult impl.
 	objResult struct {
 		sync.Mutex
-		info   *ObjectInfo
-		r      io.ReadCloser
-		err    error
+		info *ObjectInfo
+		r    io.ReadCloser
+		pw   net.Conn
+		sub  *nats.Subscription
+		err  error
+		// finished is set once the object stream has reached a terminal state
+		// (all chunks received, a fatal error, an unexpected subscription
+		// close) or the result has been Closed. It guards the one-time
+		// teardown of the subscription and the pipe write end.
+		finished bool
+		// closed records an explicit Close by the caller; Reads after that
+		// report io.ErrClosedPipe even if the internal context was canceled
+		// as part of the teardown.
+		closed bool
 		ctx    context.Context
 		cancel context.CancelFunc
 		digest hash.Hash
@@ -884,37 +895,24 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 
 	pr, pw := net.Pipe()
 	result.r = pr
-
-	gotErr := func(m *nats.Msg, err error) {
-		pw.Close()
-		m.Sub.Unsubscribe()
-		result.setErr(err)
-	}
+	result.pw = pw
 
 	// For calculating sum256
 	result.digest = sha256.New()
 
 	processChunk := func(m *nats.Msg) {
-		var err error
 		if ctx != nil {
 			select {
 			case <-ctx.Done():
-				if ctx.Err() == context.Canceled {
-					err = ctx.Err()
-				} else {
-					err = nats.ErrTimeout
-				}
-			default:
-			}
-			if err != nil {
-				gotErr(m, err)
+				result.terminal(objectStreamErr(ctx))
 				return
+			default:
 			}
 		}
 
 		tokens, err := parser.GetMetadataFields(m.Reply)
 		if err != nil {
-			gotErr(m, err)
+			result.terminal(err)
 			return
 		}
 
@@ -922,7 +920,9 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 		for b := m.Data; len(b) > 0; {
 			n, err := pw.Write(b)
 			if err != nil {
-				gotErr(m, err)
+				// Reader went away (e.g. result was Closed); nothing left
+				// to deliver, so make sure the subscription is released.
+				result.terminal(io.ErrClosedPipe)
 				return
 			}
 			b = b[n:]
@@ -932,8 +932,7 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 
 		// Check if we are done.
 		if tokens[parser.AckNumPendingTokenPos] == objNoPending {
-			pw.Close()
-			m.Sub.Unsubscribe()
+			result.terminal(nil)
 		}
 	}
 
@@ -944,9 +943,30 @@ func (obs *obs) Get(ctx context.Context, name string, opts ...GetObjectOpt) (Obj
 		nats.Context(ctx),
 		nats.BindStream(streamName),
 	}
-	_, err = obs.pushJS.Subscribe(chunkSubj, processChunk, subscribeOpts...)
+	sub, err := obs.pushJS.Subscribe(chunkSubj, processChunk, subscribeOpts...)
 	if err != nil {
+		cancel()
+		_ = pw.Close()
 		return nil, err
+	}
+	// Delivery callbacks may already be in flight, so publish the
+	// subscription under the same lock terminal() uses and re-check the
+	// terminal state to avoid leaking it.
+	result.Lock()
+	alreadyFinished := result.finished
+	if !alreadyFinished {
+		result.sub = sub
+	}
+	result.Unlock()
+	// If the subscription is closed out-of-band (consumer deleted, stream
+	// deleted, connection lost beyond ordered consumer recovery) before all
+	// chunks have been delivered, stop waiting for data and surface a
+	// terminal error instead of hanging forever claiming a clean EOF.
+	sub.SetClosedHandler(func(_ string) {
+		result.terminal(objectStreamErr(ctx))
+	})
+	if alreadyFinished {
+		_ = sub.Unsubscribe()
 	}
 
 	return result, nil
@@ -1442,82 +1462,186 @@ func (obs *obs) Status(ctx context.Context) (ObjectStoreStatus, error) {
 	return status, nil
 }
 
+// objectStreamErr maps a finished context to the error a terminated object
+// stream reports. A nil or not-yet-done context yields ErrObjectIncomplete.
+func objectStreamErr(ctx context.Context) error {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			// An explicit cancel/deadline already determined the error;
+			// the subscription closing is a consequence of it.
+			if ctx.Err() == context.Canceled {
+				return ctx.Err()
+			}
+			return nats.ErrTimeout
+		default:
+		}
+	}
+	return ErrObjectIncomplete
+}
+
+// terminal moves the result into a terminal state: the error is remembered
+// (so every subsequent Read, as well as Error/Info, reports it), the pipe
+// write end is closed (unblocking any in-flight Read) and the subscription
+// is released. A nil err means all chunks were received. It is idempotent
+// and safe to call from delivery callbacks, the subscription closed
+// handler, Read and Close concurrently.
+func (o *objResult) terminal(err error) {
+	o.Lock()
+	if o.finished {
+		o.Unlock()
+		return
+	}
+	o.finished = true
+	if err != nil && o.err == nil {
+		o.err = err
+	}
+	pw := o.pw
+	sub := o.sub
+	o.pw = nil
+	o.sub = nil
+	o.Unlock()
+
+	if pw != nil {
+		_ = pw.Close()
+	}
+	if sub != nil {
+		_ = sub.Unsubscribe()
+	}
+}
+
 // Read impl.
 func (o *objResult) Read(p []byte) (n int, err error) {
-	o.Lock()
-	defer o.Unlock()
 	readDeadline := time.Now().Add(defaultAPITimeout)
-	if ctx := o.ctx; ctx != nil {
+	ctx := o.ctx
+	if ctx != nil {
 		if deadline, ok := ctx.Deadline(); ok {
 			readDeadline = deadline
 		}
 		select {
 		case <-ctx.Done():
-			if ctx.Err() == context.Canceled {
-				o.err = ctx.Err()
-			} else {
-				o.err = nats.ErrTimeout
+			o.Lock()
+			closed := o.closed
+			o.Unlock()
+			if closed {
+				return 0, io.ErrClosedPipe
 			}
+			err := objectStreamErr(ctx)
+			o.terminal(err)
+			return 0, err
 		default:
 		}
 	}
+
+	o.Lock()
 	if o.err != nil {
-		return 0, o.err
+		// Terminal state: a failed stream check, a fatal read error or a
+		// timeout must keep returning the same error on every Read.
+		err = o.err
+		o.Unlock()
+		return 0, err
 	}
 	if o.r == nil {
+		o.Unlock()
 		return 0, io.EOF
 	}
-
 	r := o.r.(net.Conn)
+	o.Unlock()
+
+	// Do not hold the lock while blocked in Read: a delivery callback (or the
+	// subscription closed handler) must be able to latch a terminal error
+	// and close the write end to unblock us.
 	_ = r.SetReadDeadline(readDeadline)
 	n, err = r.Read(p)
 	if err, ok := err.(net.Error); ok && err.Timeout() {
-		if ctx := o.ctx; ctx != nil {
+		if ctx != nil {
 			select {
 			case <-ctx.Done():
-				if ctx.Err() == context.Canceled {
-					return 0, ctx.Err()
-				} else {
-					return 0, nats.ErrTimeout
-				}
+				terr := objectStreamErr(ctx)
+				o.terminal(terr)
+				return 0, terr
 			default:
 				err = nil
 			}
 		}
 	}
-	if err == io.EOF {
-		// Make sure the digest matches.
-		sha := o.digest.Sum(nil)
-		rsha, decodeErr := DecodeObjectDigest(o.info.Digest)
-		if decodeErr != nil {
-			o.err = decodeErr
-			return 0, o.err
+	if err != nil {
+		o.Lock()
+		// An explicit Close wins: never run the clean-EOF digest check or
+		// report a stream error after the caller closed the result.
+		if o.closed {
+			err = io.ErrClosedPipe
+			o.Unlock()
+			return n, err
 		}
-		if !bytes.Equal(sha[:], rsha) {
-			o.err = ErrDigestMismatch
-			return 0, o.err
+		// A clean EOF means all chunks have been delivered: verify the
+		// digest before reporting a complete object to the caller.
+		if err == io.EOF {
+			if o.err == nil {
+				sha := o.digest.Sum(nil)
+				rsha, decodeErr := DecodeObjectDigest(o.info.Digest)
+				if decodeErr != nil {
+					o.err = decodeErr
+				} else if !bytes.Equal(sha[:], rsha) {
+					o.err = ErrDigestMismatch
+				}
+			}
+			err = o.err
+			if err == nil {
+				err = io.EOF
+			}
+			o.Unlock()
+			return n, err
 		}
+		// Any other error surfaced by the pipe (including a write end closed
+		// from a terminal callback) becomes a latched terminal state so
+		// callers can never observe a clean success after a failed stream.
+		if o.err == nil {
+			o.err = err
+		}
+		err = o.err
+		o.Unlock()
+		o.terminal(err)
+		return n, err
 	}
-	return n, err
+	return n, nil
 }
 
 // Close impl.
 func (o *objResult) Close() error {
 	o.Lock()
-	defer o.Unlock()
 	if o.cancel != nil {
 		o.cancel()
 	}
-	if o.r == nil {
-		return nil
+	finished := o.finished
+	o.closed = true
+	if o.err == nil && o.r != nil {
+		// Reads after an explicit Close report a closed pipe rather than a
+		// spurious clean EOF (or the internal context cancellation).
+		o.err = io.ErrClosedPipe
 	}
-	return o.r.Close()
-}
+	pw := o.pw
+	sub := o.sub
+	r := o.r
+	o.pw = nil
+	o.sub = nil
+	o.finished = true
+	o.Unlock()
 
-func (o *objResult) setErr(err error) {
-	o.Lock()
-	defer o.Unlock()
-	o.err = err
+	// Release resources without holding the lock: Unsubscribe drains the
+	// ordered consumer and may synchronize with in-flight delivery.
+	if !finished {
+		if pw != nil {
+			_ = pw.Close()
+		}
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+	}
+	if r != nil {
+		return r.Close()
+	}
+	return nil
 }
 
 func (o *objResult) Info() (*ObjectInfo, error) {
