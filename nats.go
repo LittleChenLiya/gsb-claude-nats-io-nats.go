@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math/rand"
 	"net"
 	"net/http"
@@ -671,22 +670,32 @@ type Conn struct {
 	// each of these may be acquired while holding any of the ones to its
 	// left, and none of them may be acquired while holding one to its
 	// right.
-	ssid          int64
-	subsMu        sync.RWMutex
-	subs          map[int64]*Subscription
-	ach           *asyncCallbacksHandler
-	pongs         []chan struct{}
-	scratch       [scratchSize]byte
-	status        Status
-	statListeners map[Status]map[chan Status]struct{}
-	initc         bool // true if the connection is performing the initial connect
-	err           error
-	ps            *parseState
-	ptmr          *time.Timer
-	pout          int
-	ar            bool // abort reconnect
-	rqch          chan struct{}
-	ws            bool // true if a websocket connection
+	ssid   int64
+	subsMu sync.RWMutex
+	subs   map[int64]*Subscription
+	// Reconnect subscription recovery manifest, also protected by subsMu.
+	// reconnectPendingSubs holds the sids that existed when the current
+	// reconnect cycle started and still have to be resent to the new
+	// connection. Subscriptions unsubscribed while disconnected are
+	// removed so they are never re-added. reconnectRecoveredSubs holds
+	// the sids that were successfully resent during the most recent
+	// reconnect cycle. Both slices are kept sorted by sid for stable,
+	// credential-free reporting.
+	reconnectPendingSubs   []int64
+	reconnectRecoveredSubs []int64
+	ach                    *asyncCallbacksHandler
+	pongs                  []chan struct{}
+	scratch                [scratchSize]byte
+	status                 Status
+	statListeners          map[Status]map[chan Status]struct{}
+	initc                  bool // true if the connection is performing the initial connect
+	err                    error
+	ps                     *parseState
+	ptmr                   *time.Timer
+	pout                   int
+	ar                     bool // abort reconnect
+	rqch                   chan struct{}
+	ws                     bool // true if a websocket connection
 
 	// New style response handler
 	respSub       string               // The wildcard subject
@@ -3349,6 +3358,11 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 		}
 	}
 
+	// Seed the subscription recovery manifest with the subscriptions
+	// that have to be re-established once we are connected again. On
+	// retries this refreshes the pending list for the next attempt.
+	nc.initReconnectSubsSnapshot()
+
 	// This is used to wait on go routines exit if we start them in the loop
 	// but an error occurs after that.
 	waitForGoRoutines := false
@@ -3548,6 +3562,12 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 		cur.didConnect = true
 		cur.Reconnects = 0
 
+		// Refresh the pending list from the current subscriptions right
+		// before resending. A previous attempt may have failed after
+		// resending (for example a flush error), and subscriptions may
+		// have been added or removed since the attempt started.
+		nc.initReconnectSubsSnapshot()
+
 		// Send existing subscription state
 		nc.resendSubscriptions()
 
@@ -3566,6 +3586,11 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 
 		// Done with the pending buffer
 		nc.bw.doneWithPending()
+
+		// All subscriptions have been resent and accepted by the new
+		// connection, so move them from pending to recovered in the
+		// recovery manifest.
+		nc.markRecoveredSubs()
 
 		// Queue up the correct callback. If we are in initial connect state
 		// (using retry on failed connect), we will call the ConnectedCB,
@@ -3594,6 +3619,9 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 		nc.err = ErrNoServers
 	}
 	nc.mu.Unlock()
+	// The reconnect cycle ended without a recovered connection, so
+	// drop the recovery manifest rather than report stale entries.
+	nc.clearReconnectSubsSnapshot()
 	nc.close(CLOSED, true, nil)
 }
 
@@ -5158,6 +5186,12 @@ func (nc *Conn) subscribeLocked(subj, queue string, cb MsgHandler, ch chan *Msg,
 	sid := nc.ssid
 	sub.sid = sid
 	nc.subs[sid] = sub
+	// If a reconnect cycle is in progress, track this subscription in
+	// the recovery manifest so it is sent once the new connection is up.
+	// sids are allocated in increasing order, so insertion is append.
+	if nc.isReconnecting() {
+		nc.reconnectPendingSubs = append(nc.reconnectPendingSubs, sid)
+	}
 	nc.subsMu.Unlock()
 
 	// Let's start the go routine now that it is fully setup and registered.
@@ -5183,10 +5217,56 @@ func (nc *Conn) NumSubscriptions() int {
 	return len(nc.subs)
 }
 
+// SubscriptionReconnectState is a read-only snapshot of the subscription
+// recovery manifest for a connection.
+//
+// Pending holds the IDs of subscriptions that existed when the current
+// reconnect cycle started and still need to be re-established on the new
+// connection. While the connection is disconnected this lists all
+// subscriptions that will be resent; subscriptions unsubscribed during the
+// outage are removed and will not be re-added. Both slices are sorted by
+// subscription ID for stable iteration.
+//
+// Recovered holds the IDs that were successfully re-established during the
+// most recent completed reconnect cycle. The manifest only reports
+// subscription IDs; it never contains subjects, queue groups or any
+// credentials.
+type SubscriptionReconnectState struct {
+	// Pending holds subscription IDs awaiting re-establishment while a
+	// reconnect is in progress. It is empty once the connection is back.
+	Pending []int64
+	// Recovered holds subscription IDs that were re-established during
+	// the most recent reconnect cycle. It is cleared when a new cycle
+	// begins.
+	Recovered []int64
+}
+
+// SubscriptionReconnectState returns a read-only snapshot of the
+// subscription recovery manifest. While a reconnect is in progress, Pending
+// lists the subscription IDs that still have to be resent to the new
+// connection; after a successful reconnect, Recovered lists the IDs that
+// were restored. Subscriptions unsubscribed while disconnected never
+// reappear in either list. The returned slices are copies and safe to keep
+// and modify by the caller. They contain only numeric subscription IDs.
+func (nc *Conn) SubscriptionReconnectState() SubscriptionReconnectState {
+	nc.subsMu.RLock()
+	defer nc.subsMu.RUnlock()
+	state := SubscriptionReconnectState{
+		Pending:   append([]int64(nil), nc.reconnectPendingSubs...),
+		Recovered: append([]int64(nil), nc.reconnectRecoveredSubs...),
+	}
+	return state
+}
+
 // Lock for nc should be held here upon entry
 func (nc *Conn) removeSub(s *Subscription) {
 	nc.subsMu.Lock()
 	delete(nc.subs, s.sid)
+	// A subscription removed while a reconnect is in progress must not
+	// be resent to the new connection, so drop it from the pending list.
+	if i := slices.Index(nc.reconnectPendingSubs, s.sid); i >= 0 {
+		nc.reconnectPendingSubs = append(nc.reconnectPendingSubs[:i], nc.reconnectPendingSubs[i+1:]...)
+	}
 	nc.subsMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5248,6 +5328,20 @@ func (s *Subscription) Type() SubscriptionType {
 		return PullSubscription
 	}
 	return s.typ
+}
+
+// ID returns the subscription ID assigned by the client and sent to the
+// server in the SUB protocol. It is the same value reported by
+// Conn.SubscriptionReconnectState() and remains valid for the lifetime of
+// the subscription, including while the connection is reconnecting.
+// Returns -1 if called on a nil subscription.
+func (s *Subscription) ID() int64 {
+	if s == nil {
+		return -1
+	}
+	// sid is assigned once, under conn.subsMu, when the subscription is
+	// created and never changes afterwards, so a plain read is safe.
+	return s.sid
 }
 
 // IsValid returns a boolean indicating whether the subscription
@@ -6086,16 +6180,66 @@ func (nc *Conn) Buffered() (int, error) {
 	return nc.bw.buffered(), nil
 }
 
+// initReconnectSubsSnapshot seeds the subscription recovery manifest at the
+// beginning of a reconnect cycle with the subscriptions currently known to
+// the connection, sorted by sid so the pending list (and the order in which
+// subscriptions are resent) is stable. The recovered list is reset for the
+// new cycle. subsMu must NOT be held.
+func (nc *Conn) initReconnectSubsSnapshot() {
+	nc.subsMu.Lock()
+	defer nc.subsMu.Unlock()
+	pending := make([]int64, 0, len(nc.subs))
+	for sid := range nc.subs {
+		pending = append(pending, sid)
+	}
+	slices.Sort(pending)
+	nc.reconnectPendingSubs = pending
+	nc.reconnectRecoveredSubs = nil
+}
+
+// markRecoveredSubs moves every pending sid that is still registered into
+// the recovered list and clears the pending list. Called after subscriptions
+// have been successfully resent. subsMu must NOT be held.
+func (nc *Conn) markRecoveredSubs() {
+	nc.subsMu.Lock()
+	defer nc.subsMu.Unlock()
+	recovered := make([]int64, 0, len(nc.reconnectPendingSubs))
+	for _, sid := range nc.reconnectPendingSubs {
+		if _, ok := nc.subs[sid]; ok {
+			recovered = append(recovered, sid)
+		}
+	}
+	nc.reconnectPendingSubs = nil
+	nc.reconnectRecoveredSubs = recovered
+}
+
+// clearReconnectSubsSnapshot resets the recovery manifest. Used when a
+// reconnect cycle terminates without a recovered connection or when the
+// connection is closed. subsMu must NOT be held.
+func (nc *Conn) clearReconnectSubsSnapshot() {
+	nc.subsMu.Lock()
+	nc.reconnectPendingSubs = nil
+	nc.reconnectRecoveredSubs = nil
+	nc.subsMu.Unlock()
+}
+
 // resendSubscriptions will send our subscription state back to the
 // server. Used in reconnects
 func (nc *Conn) resendSubscriptions() {
 	// Since we are going to send protocols to the server, we don't want to
 	// be holding the subsMu lock (which is used in processMsg). So copy
-	// the subscriptions in a temporary map, keyed by sid as nc.subs is.
+	// the subscriptions in a temporary slice, ordered by sid so that the
+	// resend order matches the recovery manifest.
+	subs := make([]*Subscription, 0, len(nc.subs))
 	nc.subsMu.RLock()
-	subs := maps.Clone(nc.subs)
+	for _, sid := range nc.reconnectPendingSubs {
+		if s, ok := nc.subs[sid]; ok {
+			subs = append(subs, s)
+		}
+	}
 	nc.subsMu.RUnlock()
-	for sid, s := range subs {
+	for _, s := range subs {
+		sid := s.sid
 		adjustedMax := uint64(0)
 		s.mu.Lock()
 		// when resending subscriptions, the permissions error should be cleared
@@ -6228,6 +6372,8 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 		}
 	}
 	nc.subs = nil
+	nc.reconnectPendingSubs = nil
+	nc.reconnectRecoveredSubs = nil
 	nc.subsMu.Unlock()
 
 	nc.changeConnStatus(status)
