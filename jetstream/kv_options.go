@@ -65,6 +65,30 @@ func MetaOnly() WatchOpt {
 	})
 }
 
+// SnapshotBoundary instructs the key watcher to pin the end of the initial
+// snapshot to the stream's last sequence at the time the watcher starts. The
+// watcher then delivers a clear boundary:
+//
+//   - all entries that are part of the initial snapshot (revisions up to and
+//     including the pinned sequence),
+//   - a single nil entry marking the end of the snapshot,
+//   - only afterwards, updates that arrived during or after watcher startup.
+//
+// Unlike the default watcher, updates that race watcher startup can never be
+// reported ahead of the nil marker: the boundary is deterministic. Updates
+// written while the snapshot is read are neither lost nor duplicated — they
+// are always delivered as live updates after the marker, in revision order.
+//
+// The marker semantics are the same as for a default Watch (a nil entry on
+// [KeyWatcher.Updates]); when combined with [UpdatesOnly], the marker is sent
+// immediately before any live update.
+func SnapshotBoundary() WatchOpt {
+	return watchOptFn(func(opts *watchOpts) error {
+		opts.snapshotBoundary = true
+		return nil
+	})
+}
+
 // ResumeFromRevision instructs the key watcher to resume from a specific
 // revision number.
 func ResumeFromRevision(revision uint64) WatchOpt {

@@ -164,6 +164,11 @@ type (
 		// data, not the entry value.
 		// - ResumeFromRevision instructs the key watcher to resume from a
 		// specific revision number.
+		// - SnapshotBoundary pins the end of the initial snapshot to the
+		// stream's last sequence at watcher startup: the nil marker is only
+		// sent after every snapshot entry and before any live update, so
+		// updates that race startup are neither missed nor duplicated and are
+		// always reported after the marker.
 		Watch(ctx context.Context, keys string, opts ...WatchOpt) (KeyWatcher, error)
 
 		// WatchAll will watch for any updates to all keys. It can be configured
@@ -345,9 +350,12 @@ type (
 	// KeyWatcher is what is returned when doing a watch. It can be used to
 	// retrieve updates to keys. If not using UpdatesOnly option, it will also
 	// send the latest value for each key. After all initial values have been
-	// sent, a nil entry will be sent. Stop can be used to stop the watcher and
-	// close the underlying channel. Watcher will not close the channel until
-	// Stop is called or connection is closed.
+	// sent, a nil entry will be sent. With the SnapshotBoundary option, the
+	// nil entry is a deterministic boundary: it is sent exactly once, after
+	// the last snapshot entry and before the first live update, even when
+	// updates arrive while the snapshot is being read. Stop can be used to
+	// stop the watcher and close the underlying channel. Watcher will not
+	// close the channel until Stop is called or connection is closed.
 	KeyWatcher interface {
 		Updates() <-chan KeyValueEntry
 		Stop() error
@@ -396,6 +404,15 @@ type (
 		metaOnly bool
 		// resumeFromRevision is the revision to resume from.
 		resumeFromRevision uint64
+		// pin the end of the initial snapshot to the stream's last sequence
+		// at watcher startup, and only report newer updates after the nil
+		// end-of-snapshot marker.
+		snapshotBoundary bool
+		// preSubscribeHook is a test-only hook invoked after the snapshot
+		// boundary has been pinned and just before the consumer is created,
+		// letting tests deterministically interleave writes into the startup
+		// window. It is never set by public API.
+		preSubscribeHook func()
 	}
 
 	// KVDeleteOpt is used to configure delete and purge operations.
@@ -1221,6 +1238,12 @@ type watcher struct {
 	initDone    bool
 	initPending uint64
 	received    uint64
+	// snapshotBoundary is set when the watcher was created with the
+	// SnapshotBoundary option. When true, initLastSeq pins the last stream
+	// sequence that belongs to the initial snapshot; any entry with a higher
+	// revision is a live update and must be preceded by the nil marker.
+	snapshotBoundary bool
+	initLastSeq      uint64
 }
 
 // Updates returns the interior channel.
@@ -1304,14 +1327,26 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 			}
 		}
 		delta := parser.ParseNum(tokens[parser.AckNumPendingTokenPos])
+		revision := parser.ParseNum(tokens[parser.AckStreamSeqTokenPos])
 		w.mu.Lock()
 		defer w.mu.Unlock()
+
+		// With SnapshotBoundary, the initial snapshot ends at the pinned
+		// sequence. Any revision above it is a live update, even if it was
+		// already queued for delivery while the snapshot was being read.
+		// Emit the marker before such an entry so startup-window updates
+		// always appear after, never before, the end-of-snapshot marker.
+		if w.snapshotBoundary && !w.initDone && revision > w.initLastSeq {
+			w.initDone = true
+			w.updates <- nil
+		}
+
 		if !o.ignoreDeletes || (op != KeyValueDelete && op != KeyValuePurge) {
 			entry := &kve{
 				bucket:   kv.name,
 				key:      subj,
 				value:    m.Data,
-				revision: parser.ParseNum(tokens[parser.AckStreamSeqTokenPos]),
+				revision: revision,
 				created:  time.Unix(0, int64(parser.ParseNum(tokens[parser.AckTimestampSeqTokenPos]))),
 				delta:    delta,
 				op:       op,
@@ -1320,12 +1355,28 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 		}
 		// Check if done and initial values.
 		if !w.initDone {
-			w.received++
-			// Use the stable initPending value set at consumer creation.
-			// We're done if we've received all expected messages OR there are no more pending.
-			if w.received >= w.initPending || delta == 0 {
-				w.initDone = true
-				w.updates <- nil
+			if w.snapshotBoundary {
+				// Boundary mode: the snapshot ends when the delivered
+				// revision reaches the pinned last sequence. The delta==0
+				// condition is kept as a fallback for cases where revision
+				// initLastSeq is never delivered to this subscription (a
+				// subject filter that does not cover it, history pruned
+				// below the start sequence, ResumeFromRevision): the message
+				// with nothing left pending is still the last snapshot entry.
+				// Relying on delta==0 alone would finish early when an update
+				// lands in the startup window, hence the revision check.
+				if revision >= w.initLastSeq || delta == 0 {
+					w.initDone = true
+					w.updates <- nil
+				}
+			} else {
+				w.received++
+				// Use the stable initPending value set at consumer creation.
+				// We're done if we've received all expected messages OR there are no more pending.
+				if w.received >= w.initPending || delta == 0 {
+					w.initDone = true
+					w.updates <- nil
+				}
 			}
 		}
 	}
@@ -1350,6 +1401,22 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 	// update() callback.
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// With SnapshotBoundary, pin the end of the initial snapshot before the
+	// consumer is created. Any update written afterwards lands in the
+	// startup window and is deterministically delivered as a live update
+	// (after the nil marker), never lost or duplicated. If the stream state
+	// cannot be fetched, fall back to the default received/delta logic.
+	if o.snapshotBoundary && !o.updatesOnly {
+		if nfo, infoErr := kv.stream.Info(ctx); infoErr == nil {
+			w.snapshotBoundary = true
+			w.initLastSeq = nfo.State.LastSeq
+		}
+	}
+	// Test-only interleaving point, after pinning the boundary and before
+	// consumer creation (see watchOpts.preSubscribeHook).
+	if o.preSubscribeHook != nil {
+		o.preSubscribeHook()
+	}
 	var sub *nats.Subscription
 	var err error
 	if len(keys) == 1 {
@@ -1379,6 +1446,11 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 				w.initPending = initialPending
 			}
 		}
+	} else if o.snapshotBoundary {
+		// UpdatesOnly has no snapshot: send the boundary marker immediately
+		// so callers have an explicit, unambiguous start of live updates.
+		w.initDone = true
+		w.updates <- nil
 	} else {
 		// if UpdatesOnly was used, mark initialization as complete
 		w.initDone = true
